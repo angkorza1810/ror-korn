@@ -1,0 +1,182 @@
+rules_version = '2';
+
+// =====================================================================
+//  Ror-Korn : กฎความเป็นส่วนตัวของฐานข้อมูล (Cloud Firestore)
+//  วิธีใช้: Firebase Console > Firestore Database > Rules > ลบของเดิม > วางไฟล์นี้ > Publish
+//  ถ้าเปลี่ยน ID เจ้าของเว็บหรือ emailDomain ใน config.js ให้แก้บรรทัด ADMIN_EMAIL ด้วย
+// =====================================================================
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---------- ตัวช่วย ----------
+    function signedIn() { return request.auth != null; }
+    function isAdmin() { return signedIn() && request.auth.token.email == 'angkor@rorkorn.app'; }   // ADMIN_EMAIL
+    function loginId() { return request.auth.token.email.split('@')[0]; }
+    function userDoc() { return get(/databases/$(db)/documents/users/$(request.auth.uid)); }
+    function isActive() {
+      return isAdmin() || (signedIn()
+        && exists(/databases/$(db)/documents/users/$(request.auth.uid))
+        && userDoc().data.status == 'active');
+    }
+    function walletData(wid) { return get(/databases/$(db)/documents/wallets/$(wid)).data; }
+    function isMember(wid) { return isActive() && request.auth.uid in walletData(wid).memberUids; }
+    function canEdit(wid) {
+      let w = walletData(wid);
+      return isActive() && request.auth.uid in w.members && w.members[request.auth.uid] in ['admin', 'editor'];
+    }
+    function isWalletOwner(wid) { return isActive() && walletData(wid).ownerUid == request.auth.uid; }
+    function inviteExists(code) { return code is string && exists(/databases/$(db)/documents/invites/$(code)); }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // ---------- โปรไฟล์ผู้ใช้ ----------
+    // เห็นได้เฉพาะ ID ชื่อเล่น รูป และสถานะ (ไม่มีข้อมูลเงิน)
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isActive() || resource.data.handle == 'angkor');
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['handle', 'nick', 'avatar', 'status', 'via', 'inviteCode', 'createdAt'])
+        && request.resource.data.handle == loginId()
+        && request.resource.data.nick is string && request.resource.data.nick.size() > 0 && request.resource.data.nick.size() <= 40
+        && request.resource.data.avatar is string && request.resource.data.avatar.size() < 150000
+        && (request.resource.data.status == 'pending'
+            || (request.resource.data.status == 'active'
+                && (isAdmin() || (request.resource.data.via == 'invite' && inviteExists(request.resource.data.inviteCode)))));
+      allow update: if signedIn() && (
+        // เจ้าของโปรไฟล์: เปลี่ยนชื่อเล่น / รูป ได้ (ID เปลี่ยนไม่ได้)
+        (request.auth.uid == uid && changed().hasOnly(['nick', 'avatar'])
+          && request.resource.data.nick is string && request.resource.data.nick.size() > 0 && request.resource.data.nick.size() <= 40
+          && request.resource.data.avatar is string && request.resource.data.avatar.size() < 150000)
+        // คนที่รออนุมัติ แต่ได้ลิงก์เชิญ: เปิดใช้งานเองได้
+        || (request.auth.uid == uid && resource.data.status == 'pending'
+          && changed().hasOnly(['status', 'via', 'inviteCode'])
+          && request.resource.data.status == 'active' && request.resource.data.via == 'invite'
+          && inviteExists(request.resource.data.inviteCode))
+        // เจ้าของเว็บ: อนุมัติ / ปฏิเสธ / ระงับ
+        || (isAdmin() && changed().hasOnly(['status'])
+          && request.resource.data.status in ['pending', 'active', 'rejected', 'suspended'])
+      );
+      allow delete: if false;
+    }
+
+    // ---------- ลิงก์เชิญ ----------
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if isActive()
+        && request.resource.data.keys().hasOnly(['walletId', 'createdBy', 'createdAt'])
+        && request.resource.data.createdBy == request.auth.uid
+        && walletData(request.resource.data.walletId).members[request.auth.uid] == 'admin';
+      allow delete: if isActive() && walletData(resource.data.walletId).members[request.auth.uid] == 'admin';
+      allow update: if false;
+    }
+
+    // ---------- กระเป๋า ----------
+    match /wallets/{wid} {
+      allow read: if isActive() && request.auth.uid in resource.data.memberUids;
+
+      allow create: if isActive()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.memberUids == [request.auth.uid]
+        && request.resource.data.members.keys().hasOnly([request.auth.uid])
+        && request.resource.data.members[request.auth.uid] == 'admin'
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && (request.resource.data.kind == 'group'
+            || (request.resource.data.kind == 'personal' && wid == 'p_' + request.auth.uid));
+
+      allow update: if isActive() && (
+        // แอดมินของกระเป๋า: เปลี่ยนชื่อ จัดการสมาชิก สร้างลิงก์ใหม่
+        (request.auth.uid in resource.data.members && resource.data.members[request.auth.uid] == 'admin'
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.kind == resource.data.kind
+          && request.resource.data.members[resource.data.ownerUid] == 'admin'
+          && request.resource.data.members.keys().hasAll(request.resource.data.memberUids)
+          && request.resource.data.memberUids.hasAll(request.resource.data.members.keys())
+          && request.resource.data.memberUids.size() == request.resource.data.members.size()
+          && changed().hasOnly(['name', 'members', 'memberUids', 'inviteCode']))
+        // เข้าร่วมด้วยลิงก์เชิญ (ได้สิทธิ์ "เพิ่มรายการได้")
+        || (resource.data.kind == 'group' && !(request.auth.uid in resource.data.memberUids)
+          && changed().hasOnly(['members', 'memberUids', 'joinCode'])
+          && request.resource.data.joinCode == resource.data.inviteCode
+          && request.resource.data.members.diff(resource.data.members).affectedKeys().hasOnly([request.auth.uid])
+          && request.resource.data.members[request.auth.uid] == 'editor'
+          && request.resource.data.memberUids.hasAll(resource.data.memberUids)
+          && request.resource.data.memberUids.size() == resource.data.memberUids.size() + 1
+          && request.auth.uid in request.resource.data.memberUids)
+        // ออกจากกลุ่มเอง (เจ้าของกลุ่มออกไม่ได้)
+        || (request.auth.uid in resource.data.memberUids && request.auth.uid != resource.data.ownerUid
+          && changed().hasOnly(['members', 'memberUids'])
+          && request.resource.data.members.diff(resource.data.members).affectedKeys().hasOnly([request.auth.uid])
+          && !(request.auth.uid in request.resource.data.members)
+          && request.resource.data.memberUids == resource.data.memberUids.removeAll([request.auth.uid]))
+      );
+
+      allow delete: if isActive() && resource.data.ownerUid == request.auth.uid && resource.data.kind == 'group';
+
+      // รายการรายรับรายจ่าย: สมาชิกเห็น / แก้-ลบได้เฉพาะของตัวเอง
+      match /tx/{tid} {
+        allow read: if isMember(wid);
+        allow create: if canEdit(wid) && request.resource.data.uid == request.auth.uid
+          && request.resource.data.type in ['income', 'expense']
+          && request.resource.data.amount is number && request.resource.data.amount > 0
+          && request.resource.data.title is string && request.resource.data.title.size() <= 120;
+        allow update: if canEdit(wid) && resource.data.uid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.type in ['income', 'expense']
+          && request.resource.data.amount is number && request.resource.data.amount > 0;
+        allow delete: if isActive() && (resource.data.uid == request.auth.uid || isWalletOwner(wid));
+      }
+
+      // เป้าหมาย
+      match /goals/{gid} {
+        allow read: if isMember(wid);
+        allow create: if canEdit(wid) && request.resource.data.uid == request.auth.uid
+          && request.resource.data.target is number && request.resource.data.target > 0
+          && request.resource.data.ride in ['track', 'coaster', 'tornado'];
+        allow update: if canEdit(wid) && resource.data.uid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.ride in ['track', 'coaster', 'tornado'];
+        allow delete: if isActive() && (resource.data.uid == request.auth.uid || isWalletOwner(wid));
+      }
+
+      // เงินที่หยอด / ถอนจากเป้าหมาย
+      match /entries/{eid} {
+        allow read: if isMember(wid);
+        allow create: if canEdit(wid) && request.resource.data.uid == request.auth.uid
+          && request.resource.data.amount is number && request.resource.data.amount != 0;
+        allow update: if false;
+        allow delete: if isActive() && (resource.data.uid == request.auth.uid || isWalletOwner(wid)
+          || get(/databases/$(db)/documents/wallets/$(wid)/goals/$(resource.data.goalId)).data.uid == request.auth.uid);
+      }
+    }
+
+    // ---------- แชร์ค่าใช้จ่ายกับเพื่อน ----------
+    match /splits/{sid} {
+      allow read: if isActive() && request.auth.uid in resource.data.participants;
+      allow create: if isActive() && request.resource.data.payerUid == request.auth.uid
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() <= 30
+        && request.resource.data.total is number && request.resource.data.total > 0;
+      allow update: if isActive() && request.auth.uid in resource.data.participants && (
+        // คนที่ถูกแชร์: ตอบรับ / ปฏิเสธ / แจ้งว่าจ่ายแล้ว (เฉพาะช่องของตัวเอง)
+        (changed().hasOnly(['status'])
+          && request.resource.data.status.diff(resource.data.status).affectedKeys().hasOnly([request.auth.uid])
+          && request.resource.data.status[request.auth.uid] in ['accepted', 'rejected', 'paid'])
+        // คนจ่าย: ยืนยันว่าได้รับเงินแล้ว ทีละคน
+        || (request.auth.uid == resource.data.payerUid
+          && changed().hasOnly(['status', 'lastConfirmed'])
+          && request.resource.data.status.diff(resource.data.status).affectedKeys().hasOnly([request.resource.data.lastConfirmed])
+          && request.resource.data.status[request.resource.data.lastConfirmed] == 'confirmed')
+      );
+      allow delete: if isActive() && resource.data.payerUid == request.auth.uid;
+    }
+
+    // ---------- แจ้งเตือน ----------
+    match /notifications/{nid} {
+      allow read: if signedIn() && resource.data.to == request.auth.uid;
+      allow create: if signedIn() && request.resource.data.from == request.auth.uid
+        && request.resource.data.to is string && request.resource.data.read == false
+        && (isActive() || request.resource.data.type == 'signup');
+      allow update: if signedIn() && resource.data.to == request.auth.uid && changed().hasOnly(['read']);
+      allow delete: if signedIn() && resource.data.to == request.auth.uid;
+    }
+  }
+}
